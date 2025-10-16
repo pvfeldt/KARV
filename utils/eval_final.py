@@ -1,0 +1,491 @@
+import argparse
+from tqdm import tqdm
+from sparql_execution import execute_query_with_odbc, get_2hop_relations_with_odbc_wo_filter
+from logic_form_util import lisp_to_sparql
+import re
+import os
+import difflib
+import itertools
+from simcse import SimCSE
+import shutil
+
+model = SimCSE("princeton-nlp/unsup-simcse-roberta-large")
+
+
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+def is_number(t):
+    t = t.replace(" , ", ".")
+    t = t.replace(", ", ".")
+    t = t.replace(" ,", ".")
+    try:
+        float(t)
+        return True
+    except ValueError:
+        pass
+    try:
+        import unicodedata  # handle ascii
+        unicodedata.numeric(t)  # string of number --> float
+        return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split', default='test', help='split to operate on, can be `test`, `dev` and `train`')
+    parser.add_argument('--pred_file',
+                        default='Reading/LLaMA2-13b/WebQSP_Freebase_NQ_lora_epoch100/evaluation_beam/beam_test_top_k_predictions.json',
+                        help='topk prediction file')
+    parser.add_argument('--server_ip', default=None, help='server ip for debugging')
+    parser.add_argument('--server_port', default=None, help='server port for debugging')
+    parser.add_argument('--qid', default=None, type=str, help='single qid for debug, None by default')
+    parser.add_argument('--test_batch_size', default=2)
+    parser.add_argument('--dataset', default='WebQSP', type=str, help='dataset type, can be `CWQ、`WebQSP`')
+    parser.add_argument('--beam_size', default=50, type=int)
+    parser.add_argument('--golden_ent', default=False, action='store_true')
+
+    args = parser.parse_args()
+
+    print(f'split:{args.split}, topk_file:{args.pred_file}')
+    return args
+
+
+def type_checker(token: str):
+    """Check the type of a token, e.g. Integer, Float or date.
+       Return original token if no type is detected."""
+
+    pattern_year = r"^\d{4}$"
+    pattern_year_month = r"^\d{4}-\d{2}$"
+    pattern_year_month_date = r"^\d{4}-\d{2}-\d{2}$"
+    if re.match(pattern_year, token):
+        if int(token) < 3000:  # >= 3000: low possibility to be a year
+            token = token + "^^http://www.w3.org/2001/XMLSchema#dateTime"
+    elif re.match(pattern_year_month, token):
+        token = token + "^^http://www.w3.org/2001/XMLSchema#dateTime"
+    elif re.match(pattern_year_month_date, token):
+        token = token + "^^http://www.w3.org/2001/XMLSchema#dateTime"
+    else:
+        return token
+
+    return token
+
+
+def date_post_process(date_string):
+    """
+    When quering KB, (our) KB tends to autoComplete a date
+    e.g.
+        - 1996 --> 1996-01-01
+        - 1906-04-18 --> 1906-04-18 05:12:00
+    """
+    pattern_year_month_date = r"^\d{4}-\d{2}-\d{2}$"
+    pattern_year_month_date_moment = r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"
+
+    if re.match(pattern_year_month_date_moment, date_string):
+        if date_string.endswith('05:12:00'):
+            date_string = date_string.replace('05:12:00', '').strip()
+    elif re.match(pattern_year_month_date, date_string):
+        if date_string.endswith('-01-01'):
+            date_string = date_string.replace('-01-01', '').strip()
+    return date_string
+
+
+def denormalize_s_expr_new(normed_expr,
+                           entity_label_map,
+                           type_label_map,
+                           surface_index):
+    expr = normed_expr
+
+    convert_map = {
+        '( greater equal': '( ge',
+        '( greater than': '( gt',
+        '( less equal': '( le',
+        '( less than': '( lt'
+    }
+
+    for k in convert_map:
+        expr = expr.replace(k, convert_map[k])
+        expr = expr.replace(k.upper(), convert_map[k])
+
+    # expr = expr.replace(', ',' , ')
+    tokens = expr.split(' ')
+
+    segments = []
+    prev_left_bracket = False
+    prev_left_par = False
+    cur_seg = ''
+    numt = 0
+    for t in tokens:
+        numt = numt + 1
+        if t == '[':
+            prev_left_bracket = True
+            if cur_seg:
+                segments.append(cur_seg)
+        elif t == ']':
+            prev_left_bracket = False
+            cur_seg = cur_seg.strip()
+
+            # find in linear origin map
+            processed = False
+
+            if not processed:
+                if cur_seg.lower() in type_label_map:  # type
+                    cur_seg = type_label_map[cur_seg.lower()]
+                    processed = True
+                else:  # relation or unlinked entity
+                    if ' , ' in cur_seg:
+                        if is_number(cur_seg):
+                            # check if it is a number
+                            cur_seg = cur_seg.replace(" , ", ".")
+                            cur_seg = cur_seg.replace(" ,", ".")
+                            cur_seg = cur_seg.replace(", ", ".")
+                        else:
+                            # view as relation
+                            cur_seg = cur_seg.replace(' , ', ',')
+                            cur_seg = cur_seg.replace(',', '.')
+                            cur_seg = cur_seg.replace(' ', '_')
+                        processed = True
+                    else:
+                        search = True
+                        if is_number(cur_seg):
+                            search = False
+                            cur_seg = cur_seg.replace(" , ", ".")
+                            cur_seg = cur_seg.replace(" ,", ".")
+                            cur_seg = cur_seg.replace(", ", ".")
+                            cur_seg = cur_seg.replace(",", "")
+                        elif len(entity_label_map.keys()) != 0:
+                            search = False
+                            if cur_seg.lower() in entity_label_map:
+                                cur_seg = entity_label_map[cur_seg.lower()]
+                            else:
+                                similarities = model.similarity([cur_seg.lower()], list(entity_label_map.keys()))
+                                merged_list = list(zip([v for _, v in entity_label_map.items()], similarities[0]))
+                                sorted_list = sorted(merged_list, key=lambda x: x[1], reverse=True)[0]
+                                if sorted_list[1] > 0.2:
+                                    cur_seg = sorted_list[0]
+                                else:
+
+                                    search = True
+                        if search:
+                            facc1_cand_entities = surface_index.get_indexrange_entity_el_pro_one_mention(cur_seg,
+                                                                                                         top_k=50)
+                            if facc1_cand_entities:
+                                temp = []
+                                for key in list(facc1_cand_entities.keys())[1:]:
+                                    if facc1_cand_entities[key] >= 0.001:
+                                        temp.append(key)
+                                if len(temp) > 0:
+                                    cur_seg = [list(facc1_cand_entities.keys())[0]] + temp
+                                else:
+                                    cur_seg = list(facc1_cand_entities.keys())[0]
+
+            segments.append(cur_seg)
+            cur_seg = ''
+        else:
+            if prev_left_bracket:
+                # in a bracket
+                cur_seg = cur_seg + ' ' + t
+            else:
+                if t == '(':
+                    prev_left_par = True
+                    segments.append(t)
+                else:
+                    if prev_left_par:
+                        if t in ['ge', 'gt', 'le', 'lt']:  # [ge, gt, le, lt] lowercase
+                            segments.append(t)
+                        else:
+                            segments.append(t.upper())  # [and, join, r, argmax, count] upper case
+                        prev_left_par = False
+                    else:
+                        if t != ')':
+                            if t.lower() in entity_label_map:
+                                t = entity_label_map[t.lower()]
+                            else:
+                                t = type_checker(t)  # number
+                        segments.append(t)
+    combinations = [list(comb) for comb in itertools.islice(
+        itertools.product(*[item if isinstance(item, list) else [item] for item in segments]), 10000)]
+
+    exprs = [" ".join(s) for s in combinations]
+
+    return exprs
+
+def denormalize_s_expr_new_(normed_expr,
+                           entity_label_map,
+                           type_label_map):
+    expr = normed_expr
+
+    convert_map = {
+        '( greater equal': '( ge',
+        '( greater than': '( gt',
+        '( less equal': '( le',
+        '( less than': '( lt'
+    }
+
+    for k in convert_map:
+        expr = expr.replace(k, convert_map[k])
+        expr = expr.replace(k.upper(), convert_map[k])
+
+    # expr = expr.replace(', ',' , ')
+    tokens = expr.split(' ')
+
+    segments = []
+    prev_left_bracket = False
+    prev_left_par = False
+    cur_seg = ''
+    numt = 0
+    for t in tokens:
+        numt = numt + 1
+        if t == '[':
+            prev_left_bracket = True
+            if cur_seg:
+                segments.append(cur_seg)
+        elif t == ']':
+            prev_left_bracket = False
+            cur_seg = cur_seg.strip()
+
+            # find in linear origin map
+            processed = False
+
+            if not processed:
+                # entity with ","
+                if cur_seg!="" and cur_seg[0].isupper():
+                    cur_seg=cur_seg.replace(" , ",", ")
+                if cur_seg.lower() in type_label_map:  # type
+                    cur_seg = type_label_map[cur_seg.lower()]
+                    processed = True
+                elif cur_seg in entity_label_map:
+                    cur_seg=entity_label_map[cur_seg]
+                    processed = True
+                else:  # relation or unlinked entity
+                    if ' , ' in cur_seg:
+                        if is_number(cur_seg):
+                            # check if it is a number
+                            cur_seg = cur_seg.replace(" , ", ".")
+                            cur_seg = cur_seg.replace(" ,", ".")
+                            cur_seg = cur_seg.replace(", ", ".")
+                        else:
+                            # view as relation
+                            cur_seg = cur_seg.replace(' , ', ',')
+                            cur_seg = cur_seg.replace(',', '.')
+                            cur_seg = cur_seg.replace(' ', '_')
+                        processed = True
+                    else:
+                        search = True
+                        if is_number(cur_seg):
+                            search = False
+                            cur_seg = cur_seg.replace(" , ", ".")
+                            cur_seg = cur_seg.replace(" ,", ".")
+                            cur_seg = cur_seg.replace(", ", ".")
+                            cur_seg = cur_seg.replace(",", "")
+                        elif len(entity_label_map.keys()) != 0:
+                            search = False
+                            # if cur_seg.lower() in entity_label_map:
+                            if cur_seg in entity_label_map:
+                                # cur_seg = entity_label_map[cur_seg.lower()]
+                                cur_seg = entity_label_map[cur_seg]
+                            # else:
+                            #     similarities = model.similarity([cur_seg.lower()], list(entity_label_map.keys()))
+                            #     merged_list = list(zip([v for _, v in entity_label_map.items()], similarities[0]))
+                            #     sorted_list = sorted(merged_list, key=lambda x: x[1], reverse=True)[0]
+                            #     if sorted_list[1] > 0.2:
+                            #         cur_seg = sorted_list[0]
+                            #     else:
+
+                                    # search = True
+                        # if search:
+                        #     facc1_cand_entities = surface_index.get_indexrange_entity_el_pro_one_mention(cur_seg,
+                        #                                                                                  top_k=50)
+                        #     if facc1_cand_entities:
+                        #         temp = []
+                        #         for key in list(facc1_cand_entities.keys())[1:]:
+                        #             if facc1_cand_entities[key] >= 0.001:
+                        #                 temp.append(key)
+                        #         if len(temp) > 0:
+                        #             cur_seg = [list(facc1_cand_entities.keys())[0]] + temp
+                        #         else:
+                        #             cur_seg = list(facc1_cand_entities.keys())[0]
+
+            segments.append(cur_seg)
+            cur_seg = ''
+        else:
+            if prev_left_bracket:
+                # in a bracket
+                cur_seg = cur_seg + ' ' + t
+            else:
+                if t == '(':
+                    prev_left_par = True
+                    segments.append(t)
+                else:
+                    if prev_left_par:
+                        if t in ['ge', 'gt', 'le', 'lt']:  # [ge, gt, le, lt] lowercase
+                            segments.append(t)
+                        else:
+                            segments.append(t.upper())  # [and, join, r, argmax, count] upper case
+                        prev_left_par = False
+                    else:
+                        if t != ')':
+                            if t.lower() in entity_label_map:
+                                t = entity_label_map[t.lower()]
+                            else:
+                                t = type_checker(t)  # number
+                        segments.append(t)
+    combinations = [list(comb) for comb in itertools.islice(
+        itertools.product(*[item if isinstance(item, list) else [item] for item in segments]), 10000)]
+
+    exprs = [" ".join(s) for s in combinations]
+    return exprs
+
+
+def execute_normed_s_expr_from_label_maps(normed_expr,
+                                          entity_label_map,
+                                          type_label_map,
+                                          surface_index
+                                          ):
+    try:
+        denorm_sexprs = denormalize_s_expr_new(normed_expr,
+                                               entity_label_map,
+                                               type_label_map,
+                                               surface_index
+                                               )
+    except Exception as e:
+        print(e)
+        return 'null', []
+
+    query_exprs = [d.replace('( ', '(').replace(' )', ')') for d in denorm_sexprs]
+    for query_expr in query_exprs[:500]:
+        try:
+            # invalid sexprs, may leads to infinite loops
+            if 'OR' in query_expr or 'WITH' in query_expr or 'PLUS' in query_expr:
+                denotation = []
+            else:
+                sparql_query = lisp_to_sparql(query_expr)
+                denotation = execute_query_with_odbc(sparql_query)
+                denotation = [res.replace("http://rdf.freebase.com/ns/", '') for res in denotation]
+                if len(denotation) == 0:
+                    ents = set()
+                    for item in sparql_query.replace('(', ' ( ').replace(')', ' ) ').split(' '):
+                        if item.startswith("ns:m."):
+                            ents.add(item)
+                    addline = []
+                    for i, ent in enumerate(list(ents)):
+                        addline.append(f'{ent} rdfs:label ?en{i} . ')
+                        addline.append(f'?ei{i} rdfs:label ?en{i} . ')
+                        addline.append(f'FILTER (langMatches( lang(?en{i}), "EN" ) )')
+                        sparql_query = sparql_query.replace(ent, f'?ei{i}')
+                    clauses = sparql_query.split('\n')
+                    for i, line in enumerate(clauses):
+                        if line == "FILTER (!isLiteral(?x) OR lang(?x) = '' OR langMatches(lang(?x), 'en'))":
+                            clauses = clauses[:i + 1] + addline + clauses[i + 1:]
+                            break
+                    sparql_query = '\n'.join(clauses)
+                    denotation = execute_query_with_odbc(sparql_query)
+                    denotation = [res.replace("http://rdf.freebase.com/ns/", '') for res in denotation]
+        except:
+            denotation = []
+        if len(denotation) != 0:
+            break
+    if len(denotation) == 0:
+        query_expr = query_exprs[0]
+    return query_expr, denotation
+
+
+def execute_normed_s_expr_from_label_maps_rel(normed_expr,
+                                              entity_label_map,
+                                              type_label_map,
+                                              surface_index
+                                              ):
+    try:
+        denorm_sexprs = denormalize_s_expr_new(normed_expr,
+                                               entity_label_map,
+                                               type_label_map,
+                                               surface_index
+                                               )
+    except:
+        return 'null', []
+    query_exprs = [d.replace('( ', '(').replace(' )', ')') for d in denorm_sexprs]
+
+    for d in tqdm(denorm_sexprs[:50]):
+        query_expr, denotation = try_relation(d)
+        if len(denotation) != 0:
+            break
+
+    if len(denotation) == 0:
+        query_expr = query_exprs[0]
+
+    return query_expr, denotation
+
+
+def try_relation(d):
+    ent_list = set()
+    rel_list = set()
+    denorm_sexpr = d.split(' ')
+    for item in denorm_sexpr:
+        if item.startswith('m.'):
+            ent_list.add(item)
+        elif '.' in item:
+            rel_list.add(item)
+    ent_list = list(ent_list)
+    rel_list = list(rel_list)
+    cand_rels = set()
+    for ent in ent_list:
+        in_rels, out_rels, _ = get_2hop_relations_with_odbc_wo_filter(ent)
+        cand_rels = cand_rels | set(in_rels) | set(out_rels)
+    cand_rels = list(cand_rels)
+    if len(cand_rels) == 0 or len(rel_list) == 0:
+        return d.replace('( ', '(').replace(' )', ')'), []
+    similarities = model.similarity(rel_list, cand_rels)
+    change = dict()
+    for i, rel in enumerate(rel_list):
+        merged_list = list(zip(cand_rels, similarities[i]))
+        sorted_list = sorted(merged_list, key=lambda x: x[1], reverse=True)
+        change_rel = []
+        for s in sorted_list:
+            if s[1] > 0.01:
+                change_rel.append(s[0])
+        change[rel] = change_rel[:15]
+    for i, item in enumerate(denorm_sexpr):
+        if item in rel_list:
+            denorm_sexpr[i] = change[item]
+    combinations = [list(comb) for comb in itertools.islice(
+        itertools.product(*[item if isinstance(item, list) else [item] for item in denorm_sexpr]), 10000)]
+    exprs = [" ".join(s) for s in combinations][:4000]
+    query_exprs = [d.replace('( ', '(').replace(' )', ')') for d in exprs]
+    for query_expr in query_exprs:
+        try:
+            # invalid sexprs, may leads to infinite loops
+            if 'OR' in query_expr or 'WITH' in query_expr or 'PLUS' in query_expr:
+                denotation = []
+            else:
+                sparql_query = lisp_to_sparql(query_expr)
+                denotation = execute_query_with_odbc(sparql_query)
+                denotation = [res.replace("http://rdf.freebase.com/ns/", '') for res in denotation]
+                if len(denotation) == 0:
+
+                    ents = set()
+
+                    for item in sparql_query.replace('(', ' ( ').replace(')', ' ) ').split(' '):
+                        if item.startswith("ns:m."):
+                            ents.add(item)
+                    addline = []
+                    for i, ent in enumerate(list(ents)):
+                        addline.append(f'{ent} rdfs:label ?en{i} . ')
+                        addline.append(f'?ei{i} rdfs:label ?en{i} . ')
+                        addline.append(f'FILTER (langMatches( lang(?en{i}), "EN" ) )')
+                        sparql_query = sparql_query.replace(ent, f'?ei{i}')
+                    clauses = sparql_query.split('\n')
+                    for i, line in enumerate(clauses):
+                        if line == "FILTER (!isLiteral(?x) OR lang(?x) = '' OR langMatches(lang(?x), 'en'))":
+                            clauses = clauses[:i + 1] + addline + clauses[i + 1:]
+                            break
+                    sparql_query = '\n'.join(clauses)
+                    denotation = execute_query_with_odbc(sparql_query)
+                    denotation = [res.replace("http://rdf.freebase.com/ns/", '') for res in denotation]
+        except:
+            denotation = []
+        if len(denotation) != 0:
+            break
+    if len(denotation) == 0:
+        query_expr = query_exprs[0]
+    return query_expr, denotation

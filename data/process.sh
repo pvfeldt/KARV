@@ -1,0 +1,1 @@
+python process_dataset.py --dataset_type WebQSP --split train

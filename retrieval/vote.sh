@@ -1,0 +1,1 @@
+python intersect_and_vote.py --dataset_type WebQSP --model_type llama27

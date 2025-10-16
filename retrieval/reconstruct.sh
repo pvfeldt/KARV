@@ -1,0 +1,1 @@
+python reconstruct_path.py --dataset_type WebQSP --model_type llama27
