@@ -1,5 +1,7 @@
 # KARV
 
+The repository of paper **Optimizing KBQA by Correcting LLM-Generated Non-Executable Logical Form through Knowledge-Assisted Path Reconstruction [TKDE]**.
+
 ## 0 Setup
 
 ### 0.1 Knowledge Base Setup
@@ -260,3 +262,7 @@ python evaluate.py --dataset_type [dataset] --model_type [model type]
 ## Note
 
 We leave some empty folders in `KARV/generation/output`, `KARV/retrieval/output`, and `KARV/evaluation/final` to prevent errors caused by missing file storage paths.
+
+## Acknowledgements
+
+This work benefits from [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory), [ChatKBQA](https://github.com/LHRLAB/ChatKBQA), [DPR](https://huggingface.co/facebook/dpr-question_encoder-single-nq-base) and [Freebase-Setup](https://github.com/dki-lab/Freebase-Setup). The authors would like to express their gratitude for the resources provided.
