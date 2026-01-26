@@ -1,6 +1,6 @@
 # KARV
 
-The repository of paper **Optimizing KBQA by Correcting LLM-Generated Non-Executable Logical Form through Knowledge-Assisted Path Reconstruction [TKDE]**.
+The repository of paper **Optimizing KBQA by Correcting LLM-Generated Non-Executable Logical Form through Knowledge-Assisted Path Reconstruction [TKDE 2026]**.
 
 ## 0 Setup
 
