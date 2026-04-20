@@ -6,7 +6,7 @@ The repository of paper **Optimizing KBQA by Correcting LLM-Generated Non-Execut
 
 ### 0.1 Knowledge Base Setup
 
-Freebase serves as the knowledge base background for the two datasets (WebQSP, CWQ, FreebaseQA) used in this study. Detailed instructions for downloading and setting it up in Virtuoso are available [here](https://github.com/dki-lab/Freebase-Setup). 
+Freebase serves as the knowledge base background for the three datasets (WebQSP, CWQ, FreebaseQA) used in this study. Detailed instructions for downloading and setting it up in Virtuoso are available [here](https://github.com/dki-lab/Freebase-Setup). 
 
 Clone the setup repository and start up the service with the following instruction.
 
